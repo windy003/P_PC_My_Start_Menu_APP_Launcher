@@ -7,7 +7,7 @@
 
 ## 功能
 
-- 全局快捷键：`Ctrl + Shift + Alt + K`
+- 全局快捷键：默认为 `Ctrl + Shift + Alt + K`，可在托盘菜单中自定义，保存后立即生效
 - 只扫描 `%APPDATA%\Microsoft\Windows\Start Menu` **目录本身**，不进入任何子文件夹
   （因此不会读取 `Programs`、`Startup` 等子目录）
 - 支持 `.lnk`、`.url`、`.appref-ms` 三种快捷方式
@@ -15,7 +15,8 @@
 - `↑` / `↓` 选择，`Enter` 或鼠标单击打开，`Esc` 或点击窗口外关闭
 - 输入文字可即时过滤（支持空格分隔的多个关键字）
 - 打开过的快捷方式自动移到顶部，并保存到 `%APPDATA%\StartMenuLauncher\settings.json`
-- 系统托盘常驻：左键打开；右键菜单可打开 / 刷新应用列表 / 退出（菜单打开时按 `X` 也可退出）
+- 系统托盘常驻：左键打开；右键菜单可打开 / 刷新应用列表 / 设置全局快捷键 / 重启 / 退出
+  （菜单打开时按 `R` 重启、按 `X` 退出）
 - 单实例运行：重复启动只会唤起已经运行的窗口
 
 ## 安装
@@ -59,8 +60,9 @@ pythonw .\start_menu_launcher.py
 
 ## 修改快捷键
 
-在 `start_menu_launcher.py` 顶部的这几个常量中修改：
+推荐在系统托盘的右键菜单中选择「设置全局快捷键…」，点击输入框后直接按下新的组合键，
+再点「保存」即可，无需重启程序。快捷键必须包含 `Ctrl`、`Alt` 或 `Win` 键；
+如果组合键已被其他程序占用，界面会给出提示并保留原来的快捷键。
 
-- `HOTKEY_MODS`：修饰键组合（Alt / Ctrl / Shift）
-- `HOTKEY_VK`：主键的 Windows 虚拟键码，`0x4B` 表示 `K`
-- `HOTKEY_LABEL`：只影响界面和提示文字
+也可以直接编辑 `%APPDATA%\StartMenuLauncher\settings.json` 中的 `hotkey` 字段
+（例如 `"hotkey": "Ctrl+Shift+Space"`），然后从托盘菜单重启程序。

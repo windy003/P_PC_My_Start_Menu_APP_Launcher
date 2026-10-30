@@ -1,9 +1,10 @@
 #!/usr/bin/env pythonw
 """Windows 11 quick launcher for shortcuts in the user's Start Menu root.
 
-Press Ctrl+Shift+Alt+K to open a Spotlight-style window. Only shortcut files
-directly inside %APPDATA%\\Microsoft\\Windows\\Start Menu are listed; subfolders
-such as Programs are intentionally ignored.
+Press the global hotkey (Ctrl+Shift+Alt+K by default, configurable from the
+tray menu) to open a Spotlight-style window. Only shortcut files directly
+inside %APPDATA%\\Microsoft\\Windows\\Start Menu are listed; subfolders such as
+Programs are intentionally ignored.
 """
 
 from __future__ import annotations
@@ -24,6 +25,8 @@ from PyQt6.QtCore import (
     QEasingCurve,
     QEvent,
     QFileInfo,
+    QKeyCombination,
+    QProcess,
     QPropertyAnimation,
     QRectF,
     QSize,
@@ -40,6 +43,7 @@ from PyQt6.QtGui import (
     QFont,
     QIcon,
     QInputMethodEvent,
+    QKeySequence,
     QLinearGradient,
     QPainter,
     QPainterPath,
@@ -50,6 +54,8 @@ from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QDialog,
+    QDialogButtonBox,
     QFileIconProvider,
     QFrame,
     QGraphicsDropShadowEffect,
@@ -60,6 +66,7 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QMenu,
     QMessageBox,
+    QPushButton,
     QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
@@ -69,16 +76,17 @@ APP_NAME = "快速启动"
 APP_ID = "StartMenuLauncher"
 SERVER_NAME = "StartMenuLauncher.SingleInstance.v1"
 
-HOTKEY_LABEL = "Ctrl + Shift + Alt + K"
 HOTKEY_ID = 0xB001
+HOTKEY_PROBE_ID = 0xB002
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
+MOD_WIN = 0x0008
 MOD_NOREPEAT = 0x4000
-HOTKEY_MODS = MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT
-HOTKEY_VK = 0x4B  # K
+DEFAULT_HOTKEY_TEXT = "Ctrl+Shift+Alt+K"
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
+WM_RECONFIGURE_HOTKEY = 0x8000 + 1  # WM_APP + 1
 
 USER_START_MENU = (
     Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
@@ -160,14 +168,216 @@ def force_foreground(window: QWidget) -> None:
             user32.AttachThreadInput(fg_thread, current_thread, False)
 
 
+# ---------------------------------------------------------------------------
+# Hotkey specification and conversion
+# ---------------------------------------------------------------------------
+
+_MODIFIER_ORDER = (
+    (MOD_CONTROL, "Ctrl"),
+    (MOD_SHIFT, "Shift"),
+    (MOD_ALT, "Alt"),
+    (MOD_WIN, "Win"),
+)
+
+# Qt key -> Windows virtual-key code for keys whose values do not coincide.
+_QT_KEY_TO_VK = {
+    Qt.Key.Key_Left: 0x25,
+    Qt.Key.Key_Up: 0x26,
+    Qt.Key.Key_Right: 0x27,
+    Qt.Key.Key_Down: 0x28,
+    Qt.Key.Key_Home: 0x24,
+    Qt.Key.Key_End: 0x23,
+    Qt.Key.Key_PageUp: 0x21,
+    Qt.Key.Key_PageDown: 0x22,
+    Qt.Key.Key_Insert: 0x2D,
+    Qt.Key.Key_Delete: 0x2E,
+    Qt.Key.Key_Space: 0x20,
+    Qt.Key.Key_Backspace: 0x08,
+    Qt.Key.Key_Tab: 0x09,
+    Qt.Key.Key_Return: 0x0D,
+    Qt.Key.Key_Enter: 0x0D,
+    Qt.Key.Key_Escape: 0x1B,
+    Qt.Key.Key_Pause: 0x13,
+    Qt.Key.Key_Print: 0x2C,
+    Qt.Key.Key_ScrollLock: 0x91,
+    Qt.Key.Key_CapsLock: 0x14,
+    Qt.Key.Key_NumLock: 0x90,
+    Qt.Key.Key_Semicolon: 0xBA,
+    Qt.Key.Key_Equal: 0xBB,
+    Qt.Key.Key_Comma: 0xBC,
+    Qt.Key.Key_Minus: 0xBD,
+    Qt.Key.Key_Period: 0xBE,
+    Qt.Key.Key_Slash: 0xBF,
+    Qt.Key.Key_QuoteLeft: 0xC0,
+    Qt.Key.Key_BracketLeft: 0xDB,
+    Qt.Key.Key_Backslash: 0xDC,
+    Qt.Key.Key_BracketRight: 0xDD,
+    Qt.Key.Key_Apostrophe: 0xDE,
+}
+
+_VK_NAMES = {
+    0x25: "Left",
+    0x26: "Up",
+    0x27: "Right",
+    0x28: "Down",
+    0x24: "Home",
+    0x23: "End",
+    0x21: "PageUp",
+    0x22: "PageDown",
+    0x2D: "Insert",
+    0x2E: "Delete",
+    0x20: "Space",
+    0x08: "Backspace",
+    0x09: "Tab",
+    0x0D: "Enter",
+    0x1B: "Esc",
+    0x13: "Pause",
+    0x2C: "PrintScreen",
+    0x91: "ScrollLock",
+    0x14: "CapsLock",
+    0x90: "NumLock",
+    0xBA: ";",
+    0xBB: "=",
+    0xBC: ",",
+    0xBD: "-",
+    0xBE: ".",
+    0xBF: "/",
+    0xC0: "`",
+    0xDB: "[",
+    0xDC: "\\",
+    0xDD: "]",
+    0xDE: "'",
+}
+
+
+@dataclass(frozen=True)
+class HotkeySpec:
+    """A global hotkey: Win32 modifier bits, a virtual-key code, and its text."""
+
+    mods: int
+    vk: int
+    text: str
+
+    @property
+    def register_mods(self) -> int:
+        return self.mods | MOD_NOREPEAT
+
+    @property
+    def label(self) -> str:
+        parts = [name for bit, name in _MODIFIER_ORDER if self.mods & bit]
+        parts.append(vk_name(self.vk))
+        return " + ".join(parts)
+
+
+# Key events hand out plain ints in some PyQt6 builds, so look keys up by value.
+_QT_KEY_VALUE_TO_VK = {key.value: vk for key, vk in _QT_KEY_TO_VK.items()}
+
+
+def qt_key_to_vk(key) -> int | None:
+    value = getattr(key, "value", key)
+    if not isinstance(value, int):
+        return None
+    vk = _QT_KEY_VALUE_TO_VK.get(value)
+    if vk is not None:
+        return vk
+    if 0x41 <= value <= 0x5A or 0x30 <= value <= 0x39:  # A-Z, 0-9
+        return value
+    f1 = int(Qt.Key.Key_F1.value)
+    if f1 <= value <= int(Qt.Key.Key_F24.value):
+        return 0x70 + (value - f1)
+    return None
+
+
+def vk_name(vk: int) -> str:
+    if 0x41 <= vk <= 0x5A or 0x30 <= vk <= 0x39:
+        return chr(vk)
+    if 0x70 <= vk <= 0x87:
+        return f"F{vk - 0x6F}"
+    return _VK_NAMES.get(vk, f"0x{vk:02X}")
+
+
+def mods_from_qt(qmods) -> int:
+    mods = 0
+    if qmods & Qt.KeyboardModifier.ControlModifier:
+        mods |= MOD_CONTROL
+    if qmods & Qt.KeyboardModifier.ShiftModifier:
+        mods |= MOD_SHIFT
+    if qmods & Qt.KeyboardModifier.AltModifier:
+        mods |= MOD_ALT
+    if qmods & Qt.KeyboardModifier.MetaModifier:
+        mods |= MOD_WIN
+    return mods
+
+
+def hotkey_from_qt_key(key, qmods) -> HotkeySpec | None:
+    """Build a spec from a key event's key and modifiers."""
+    vk = qt_key_to_vk(key)
+    if vk is None:
+        return None
+    qt_key = key if isinstance(key, Qt.Key) else Qt.Key(key)
+    text = QKeySequence(QKeyCombination(qmods, qt_key)).toString(
+        QKeySequence.SequenceFormat.PortableText
+    )
+    if not text:
+        return None
+    return HotkeySpec(mods_from_qt(qmods), vk, text)
+
+
+def parse_hotkey(text: object) -> HotkeySpec | None:
+    """Parse a stored hotkey string such as "Ctrl+Shift+Alt+K"."""
+    if not isinstance(text, str) or not text.strip():
+        return None
+    normalized = re.sub(r"\bwin\b", "Meta", text.strip(), flags=re.IGNORECASE)
+    normalized = re.sub(r"\bPageUp\b", "PgUp", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\bPageDown\b", "PgDown", normalized, flags=re.IGNORECASE)
+    sequence = QKeySequence(normalized, QKeySequence.SequenceFormat.PortableText)
+    if sequence.isEmpty():
+        return None
+    combination = sequence[0]
+    vk = qt_key_to_vk(combination.key())
+    if vk is None:
+        return None
+    canonical = QKeySequence(combination).toString(
+        QKeySequence.SequenceFormat.PortableText
+    )
+    return HotkeySpec(mods_from_qt(combination.keyboardModifiers()), vk, canonical or text)
+
+
+def default_hotkey() -> HotkeySpec:
+    spec = parse_hotkey(DEFAULT_HOTKEY_TEXT)
+    if spec is None:  # Defensive: QKeySequence always parses the default.
+        return HotkeySpec(MOD_CONTROL | MOD_SHIFT | MOD_ALT, 0x4B, DEFAULT_HOTKEY_TEXT)
+    return spec
+
+
+def probe_hotkey(spec: HotkeySpec) -> tuple[bool, int]:
+    """Check whether the combination can be registered right now."""
+    if user32.RegisterHotKey(None, HOTKEY_PROBE_ID, spec.register_mods, spec.vk):
+        user32.UnregisterHotKey(None, HOTKEY_PROBE_ID)
+        return True, 0
+    return False, ctypes.get_last_error()
+
+
+def registration_error_text(spec: HotkeySpec, error: int) -> str:
+    return (
+        f"无法注册全局快捷键 {spec.label}（错误码 {error}）。\n"
+        "该组合键可能已被其他程序占用。"
+    )
+
+
 class HotkeyThread(QThread):
     """Owns the global hotkey and its Win32 message loop."""
 
     activated = pyqtSignal()
     failed = pyqtSignal(str)
+    reconfigured = pyqtSignal(bool, str)
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, spec: HotkeySpec, parent=None) -> None:
         super().__init__(parent)
+        self._spec = spec
+        self._registered: HotkeySpec | None = None
+        self._pending: HotkeySpec | None = None
+        self._lock = threading.Lock()
         self._thread_id = 0
         self._stop_event = threading.Event()
 
@@ -175,13 +385,12 @@ class HotkeyThread(QThread):
         self._thread_id = kernel32.GetCurrentThreadId()
         if self._stop_event.is_set():
             return
-        if not user32.RegisterHotKey(None, HOTKEY_ID, HOTKEY_MODS, HOTKEY_VK):
-            error = ctypes.get_last_error()
-            self.failed.emit(
-                f"无法注册全局快捷键 {HOTKEY_LABEL}（错误码 {error}）。\n"
-                "该组合键可能已被其他程序占用。"
-            )
-            return
+        if self._register(self._spec):
+            self._registered = self._spec
+        else:
+            self.failed.emit(registration_error_text(self._spec, ctypes.get_last_error()))
+        # A request that arrived before the loop started is applied here.
+        self._apply_pending()
 
         msg = wintypes.MSG()
         try:
@@ -189,12 +398,54 @@ class HotkeyThread(QThread):
                 result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
                 if result == 0 or result == -1:
                     break
-                if msg.message == WM_HOTKEY and msg.wParam == HOTKEY_ID:
+                if (
+                    msg.message == WM_HOTKEY
+                    and msg.wParam == HOTKEY_ID
+                    and self._registered is not None
+                ):
                     self.activated.emit()
+                elif msg.message == WM_RECONFIGURE_HOTKEY:
+                    self._apply_pending()
                 user32.TranslateMessage(ctypes.byref(msg))
                 user32.DispatchMessageW(ctypes.byref(msg))
         finally:
+            if self._registered is not None:
+                user32.UnregisterHotKey(None, HOTKEY_ID)
+            self._registered = None
+
+    def request(self, spec: HotkeySpec) -> None:
+        """Ask the message loop to switch to another hotkey, without blocking."""
+        with self._lock:
+            self._pending = spec
+        thread_id = self._thread_id
+        if thread_id:
+            user32.PostThreadMessageW(thread_id, WM_RECONFIGURE_HOTKEY, 0, 0)
+
+    def _register(self, spec: HotkeySpec) -> bool:
+        return bool(user32.RegisterHotKey(None, HOTKEY_ID, spec.register_mods, spec.vk))
+
+    def _apply_pending(self) -> None:
+        with self._lock:
+            pending = self._pending
+            self._pending = None
+        if pending is None or pending == self._registered:
+            return
+
+        previous = self._registered
+        if previous is not None:
             user32.UnregisterHotKey(None, HOTKEY_ID)
+            self._registered = None
+
+        if self._register(pending):
+            self._spec = pending
+            self._registered = pending
+            self.reconfigured.emit(True, "")
+            return
+
+        error = ctypes.get_last_error()
+        if previous is not None and self._register(previous):
+            self._registered = previous
+        self.reconfigured.emit(False, registration_error_text(pending, error))
 
     def stop(self) -> None:
         self._stop_event.set()
@@ -264,28 +515,46 @@ def scan_start_menu() -> list[ShortcutEntry]:
     return entries
 
 
-def load_order() -> list[str]:
+def load_settings() -> dict:
     try:
         payload = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return []
-    if not isinstance(payload, dict):
-        return []
-    order = payload.get("order")
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def save_settings(settings: dict) -> None:
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        temp = SETTINGS_FILE.with_name(SETTINGS_FILE.name + ".tmp")
+        temp.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp, SETTINGS_FILE)
+    except OSError:
+        pass
+
+
+def load_order() -> list[str]:
+    order = load_settings().get("order")
     if not isinstance(order, list):
         return []
     return [item for item in order if isinstance(item, str)]
 
 
 def save_order(entries: list[ShortcutEntry]) -> None:
-    try:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        temp = SETTINGS_FILE.with_name(SETTINGS_FILE.name + ".tmp")
-        payload = {"order": [str(entry.path) for entry in entries]}
-        temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(temp, SETTINGS_FILE)
-    except OSError:
-        pass
+    settings = load_settings()
+    settings["order"] = [str(entry.path) for entry in entries]
+    save_settings(settings)
+
+
+def load_hotkey() -> HotkeySpec:
+    spec = parse_hotkey(load_settings().get("hotkey"))
+    return spec if spec is not None else default_hotkey()
+
+
+def save_hotkey(spec: HotkeySpec) -> None:
+    settings = load_settings()
+    settings["hotkey"] = spec.text
+    save_settings(settings)
 
 
 # ---------------------------------------------------------------------------
@@ -340,14 +609,238 @@ def make_placeholder_icon() -> QIcon:
 
 
 # ---------------------------------------------------------------------------
+# Hotkey settings dialog
+# ---------------------------------------------------------------------------
+
+
+_PURE_MODIFIER_KEYS = {
+    Qt.Key.Key_Control,
+    Qt.Key.Key_Shift,
+    Qt.Key.Key_Alt,
+    Qt.Key.Key_Meta,
+    Qt.Key.Key_CapsLock,
+    Qt.Key.Key_NumLock,
+    Qt.Key.Key_ScrollLock,
+}
+_alt_gr = getattr(Qt.Key, "Key_AltGr", None)
+if _alt_gr is not None:
+    _PURE_MODIFIER_KEYS.add(_alt_gr)
+del _alt_gr
+
+
+class HotkeyCapture(QLineEdit):
+    """A read-only field that records the next key combination pressed in it."""
+
+    spec_changed = pyqtSignal(object)
+    message = pyqtSignal(str)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("HotkeyCapture")
+        self.setReadOnly(True)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setFixedHeight(52)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._spec: HotkeySpec | None = None
+
+    def selected_spec(self) -> HotkeySpec | None:
+        return self._spec
+
+    def set_spec(self, spec: HotkeySpec | None) -> None:
+        self._spec = spec
+        self.setText(spec.label if spec is not None else "")
+
+    def keyPressEvent(self, event):  # noqa: N802 (Qt override)
+        key = event.key()
+        if key in _PURE_MODIFIER_KEYS:
+            event.accept()
+            return
+        if key == Qt.Key.Key_Escape:
+            # Let the dialog handle Esc so it cancels the whole dialog.
+            super().keyPressEvent(event)
+            return
+
+        mods = mods_from_qt(event.modifiers())
+        if not mods & (MOD_CONTROL | MOD_ALT | MOD_WIN):
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                super().keyPressEvent(event)
+                return
+            self.message.emit("快捷键需要包含 Ctrl、Alt 或 Win 键")
+            event.accept()
+            return
+
+        spec = hotkey_from_qt_key(key, event.modifiers())
+        if spec is None:
+            self.message.emit("这个按键不能用作全局快捷键")
+            event.accept()
+            return
+
+        self.set_spec(spec)
+        self.message.emit("")
+        self.spec_changed.emit(spec)
+        event.accept()
+
+
+class HotkeyDialog(QDialog):
+    def __init__(self, current: HotkeySpec, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._spec: HotkeySpec | None = current
+        self.setWindowTitle("设置全局快捷键")
+        self.setModal(True)
+        self.setFixedWidth(440)
+        self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
+        if parent is not None:
+            self.setWindowIcon(parent.windowIcon())
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 18)
+        layout.setSpacing(12)
+
+        title = QLabel("全局快捷键", self)
+        title.setObjectName("DialogTitle")
+        layout.addWidget(title)
+
+        description = QLabel(
+            "点击下方输入框，然后按下新的组合键。全局快捷键在任何程序中都能唤起启动器。",
+            self,
+        )
+        description.setObjectName("DialogText")
+        description.setWordWrap(True)
+        layout.addWidget(description)
+
+        self.capture = HotkeyCapture(self)
+        self.capture.set_spec(current)
+        self.capture.spec_changed.connect(self._on_spec_changed)
+        self.capture.message.connect(self._show_message)
+        layout.addWidget(self.capture)
+
+        self.hint = QLabel("", self)
+        self.hint.setObjectName("DialogHint")
+        self.hint.setWordWrap(True)
+        self.hint.setMinimumHeight(18)
+        layout.addWidget(self.hint)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        reset_button = QPushButton("恢复默认", self)
+        reset_button.setAutoDefault(False)
+        reset_button.clicked.connect(self._restore_default)
+        buttons.addWidget(reset_button)
+        buttons.addStretch(1)
+
+        self.button_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save
+            | QDialogButtonBox.StandardButton.Cancel,
+            self,
+        )
+        self.button_box.button(QDialogButtonBox.StandardButton.Save).setText("保存")
+        self.button_box.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        self.button_box.accepted.connect(self.accept)
+        self.button_box.rejected.connect(self.reject)
+        self.button_box.button(QDialogButtonBox.StandardButton.Save).setDefault(True)
+        buttons.addWidget(self.button_box)
+        layout.addLayout(buttons)
+
+        self.setStyleSheet(
+            """
+            QDialog {
+                background-color: #FFFFFF;
+            }
+            QLabel#DialogTitle {
+                color: #1A1A1A;
+                font-size: 13pt;
+                font-weight: 600;
+            }
+            QLabel#DialogText {
+                color: #6A6A6A;
+                font-size: 9.5pt;
+            }
+            QLabel#DialogHint {
+                color: #B4453A;
+                font-size: 9pt;
+            }
+            QLineEdit#HotkeyCapture {
+                background-color: #F5F6F8;
+                border: 1px solid #D8D8D8;
+                border-radius: 10px;
+                color: #1A1A1A;
+                font-size: 12pt;
+                font-weight: 600;
+                selection-background-color: transparent;
+            }
+            QLineEdit#HotkeyCapture:focus {
+                background-color: #FFFFFF;
+                border: 1px solid #4F8EF7;
+            }
+            QPushButton {
+                min-width: 72px;
+                padding: 6px 16px;
+                border: 1px solid #D0D0D0;
+                border-radius: 6px;
+                background-color: #F7F7F7;
+                color: #202020;
+            }
+            QPushButton:hover {
+                background-color: #EFEFEF;
+            }
+            QPushButton:default {
+                background-color: #2F6FEB;
+                border-color: #2F6FEB;
+                color: #FFFFFF;
+            }
+            QPushButton:default:hover {
+                background-color: #2861D0;
+            }
+            """
+        )
+
+    def selected_hotkey(self) -> HotkeySpec | None:
+        return self._spec
+
+    def _on_spec_changed(self, spec: HotkeySpec) -> None:
+        self._spec = spec
+
+    def _show_message(self, message: str) -> None:
+        self.hint.setText(message)
+
+    def _restore_default(self) -> None:
+        spec = default_hotkey()
+        self.capture.set_spec(spec)
+        self._spec = spec
+        self.hint.setText("")
+        self.capture.setFocus(Qt.FocusReason.ShortcutFocusReason)
+
+    def accept(self) -> None:
+        if self._spec is None:
+            self.hint.setText("请先按下一个组合键")
+            return
+        super().accept()
+
+    def showEvent(self, event):  # noqa: N802 (Qt override)
+        super().showEvent(event)
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        if screen is not None:
+            geometry = self.frameGeometry()
+            geometry.moveCenter(screen.availableGeometry().center())
+            self.move(geometry.topLeft())
+        self.capture.setFocus(Qt.FocusReason.ShortcutFocusReason)
+
+
+# ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 
 
 class LauncherWindow(QWidget):
-    def __init__(self, app_icon: QIcon) -> None:
+    hotkey_changed = pyqtSignal(str)
+
+    def __init__(self, app_icon: QIcon, hotkey_spec: HotkeySpec) -> None:
         super().__init__()
         self._app_icon = app_icon
+        self._hotkey_spec = hotkey_spec
+        self._hotkey_thread: HotkeyThread | None = None
+        self._revert_spec: HotkeySpec | None = None
         self.entries: list[ShortcutEntry] = []
         self.visible_entries: list[ShortcutEntry] = []
         self._items_by_key: dict[str, QListWidgetItem] = {}
@@ -746,6 +1239,55 @@ class LauncherWindow(QWidget):
         else:
             QMessageBox.warning(self, title, message)
 
+    # -- Hotkey -----------------------------------------------------------
+
+    def current_hotkey(self) -> HotkeySpec:
+        return self._hotkey_spec
+
+    def attach_hotkey_thread(self, thread: HotkeyThread) -> None:
+        self._hotkey_thread = thread
+        thread.reconfigured.connect(self._on_hotkey_reconfigured)
+
+    def open_hotkey_settings(self) -> None:
+        dialog = HotkeyDialog(self._hotkey_spec, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        spec = dialog.selected_hotkey()
+        if spec is None or spec == self._hotkey_spec:
+            return
+
+        available, error = probe_hotkey(spec)
+        if not available:
+            self.notify(
+                "无法设置快捷键",
+                f"快捷键 {spec.label} 当前不可用（错误码 {error}）。\n"
+                "该组合键可能已被其他程序占用，请换一个。",
+            )
+            return
+
+        self._revert_spec = self._hotkey_spec
+        self._hotkey_spec = spec
+        save_hotkey(spec)
+        self.hotkey_changed.emit(spec.label)
+        if self._hotkey_thread is not None:
+            self._hotkey_thread.request(spec)
+
+    def _on_hotkey_reconfigured(self, ok: bool, message: str) -> None:
+        if ok:
+            self._revert_spec = None
+            return
+
+        self.notify("无法设置快捷键", message)
+        previous = self._revert_spec
+        self._revert_spec = None
+        if previous is None:
+            return
+        self._hotkey_spec = previous
+        save_hotkey(previous)
+        self.hotkey_changed.emit(previous.label)
+        if self._hotkey_thread is not None:
+            self._hotkey_thread.request(previous)
+
     # -- Events -----------------------------------------------------------
 
     def event(self, event):  # noqa: N802 (Qt override)
@@ -805,6 +1347,13 @@ class LauncherWindow(QWidget):
 # ---------------------------------------------------------------------------
 
 
+def restart_arguments() -> list[str]:
+    """Arguments that relaunch this script (or the frozen executable)."""
+    if getattr(sys, "frozen", False):
+        return sys.argv[1:]
+    return sys.argv
+
+
 def notify_existing_instance() -> bool:
     socket = QLocalSocket()
     socket.connectToServer(SERVER_NAME)
@@ -842,7 +1391,8 @@ def main() -> int:
     if notify_existing_instance():
         return 0
 
-    window = LauncherWindow(app_icon)
+    hotkey_spec = load_hotkey()
+    window = LauncherWindow(app_icon, hotkey_spec)
 
     server = QLocalServer()
     QLocalServer.removeServer(SERVER_NAME)
@@ -865,22 +1415,29 @@ def main() -> int:
     server.newConnection.connect(handle_connection)
 
     tray: QSystemTrayIcon | None = None
+    open_action: QAction | None = None
     if QSystemTrayIcon.isSystemTrayAvailable():
         tray = QSystemTrayIcon(app_icon)
-        tray.setToolTip(f"{APP_NAME} · {HOTKEY_LABEL}")
+        tray.setToolTip(f"{APP_NAME} · {hotkey_spec.label}")
 
         menu = QMenu()
-        open_action = QAction(f"打开启动器    {HOTKEY_LABEL}", menu)
+        open_action = QAction(f"打开启动器    {hotkey_spec.label}", menu)
         refresh_action = QAction("刷新应用列表", menu)
-        # (&X) makes X an accelerator while the tray menu is open.
+        hotkey_action = QAction("设置全局快捷键…", menu)
+        # (&R) / (&X) make R / X accelerators while the tray menu is open.
+        restart_action = QAction("重启(&R)", menu)
         quit_action = QAction("退出(&X)", menu)
         menu.addAction(open_action)
         menu.addAction(refresh_action)
+        menu.addSeparator()
+        menu.addAction(hotkey_action)
+        menu.addAction(restart_action)
         menu.addSeparator()
         menu.addAction(quit_action)
 
         open_action.triggered.connect(window.show_launcher)
         refresh_action.triggered.connect(window.refresh_entries)
+        hotkey_action.triggered.connect(window.open_hotkey_settings)
 
         tray.setContextMenu(menu)
 
@@ -895,7 +1452,16 @@ def main() -> int:
         tray.show()
         window.tray_icon = tray
 
-    hotkey = HotkeyThread()
+    hotkey = HotkeyThread(hotkey_spec)
+    window.attach_hotkey_thread(hotkey)
+
+    def on_hotkey_label_changed(label: str) -> None:
+        if open_action is not None:
+            open_action.setText(f"打开启动器    {label}")
+        if tray is not None:
+            tray.setToolTip(f"{APP_NAME} · {label}")
+
+    window.hotkey_changed.connect(on_hotkey_label_changed)
 
     def on_hotkey_failed(message: str) -> None:
         if tray is not None and tray.isVisible():
@@ -919,9 +1485,40 @@ def main() -> int:
             tray.hide()
         app.quit()
 
+    def restart_application() -> None:
+        nonlocal hotkey
+        # Release the hotkey and the single-instance name before the new process
+        # starts, otherwise it would just ask the old instance to show.
+        hotkey.stop()
+        window.hide_launcher()
+        server.close()
+        QLocalServer.removeServer(SERVER_NAME)
+        if QProcess.startDetached(sys.executable, restart_arguments()):
+            if tray is not None:
+                tray.hide()
+            app.quit()
+            return
+
+        # Could not launch a new process: bring this instance back instead of
+        # leaving the user without a launcher.
+        server.listen(SERVER_NAME)
+        hotkey = HotkeyThread(window.current_hotkey())
+        window.attach_hotkey_thread(hotkey)
+        hotkey.activated.connect(window.toggle_launcher)
+        hotkey.failed.connect(on_hotkey_failed)
+        hotkey.start()
+        if tray is not None:
+            tray.showMessage(
+                "无法重启",
+                "启动新实例失败，已恢复当前实例。",
+                QSystemTrayIcon.MessageIcon.Warning,
+                5000,
+            )
+
     if tray is not None:
         quit_action.triggered.connect(quit_application)
-    app.aboutToQuit.connect(hotkey.stop)
+        restart_action.triggered.connect(restart_application)
+    app.aboutToQuit.connect(lambda: hotkey.stop())
 
     exit_code = app.exec()
 
