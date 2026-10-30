@@ -2,7 +2,7 @@
 """Windows 11 quick launcher for shortcuts in the user's Start Menu root.
 
 Press the global hotkey (Ctrl+Shift+Alt+K by default, configurable from the
-tray menu) to open a Spotlight-style window. Only shortcut files directly
+tray menu) to open a full-screen launcher. Only shortcut files directly
 inside %APPDATA%\\Microsoft\\Windows\\Start Menu are listed; subfolders such as
 Programs are intentionally ignored.
 """
@@ -16,6 +16,7 @@ import re
 import sys
 import threading
 import time
+import uuid
 from collections import Counter
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -42,6 +43,7 @@ from PyQt6.QtGui import (
     QCursor,
     QFont,
     QIcon,
+    QImage,
     QInputMethodEvent,
     QKeySequence,
     QLinearGradient,
@@ -99,15 +101,12 @@ SHORTCUT_SUFFIXES = {".lnk", ".url", ".appref-ms"}
 CONFIG_DIR = Path(os.environ.get("APPDATA", Path.home())) / APP_ID
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
 
-WINDOW_WIDTH = 600
 SHADOW_MARGIN = 22
 SEARCH_HEIGHT = 58
 FOOTER_HEIGHT = 34
-ITEM_HEIGHT = 42
+ITEM_HEIGHT = 104
 ITEM_SPACING = 2
-ROW_STEP = ITEM_HEIGHT + ITEM_SPACING * 2
-MAX_ROWS = 9
-LIST_PADDING = 12
+LIST_ICON_SIZE = 96
 
 if sys.platform != "win32":
     raise SystemExit("This application only runs on Windows.")
@@ -146,6 +145,90 @@ user32.SetForegroundWindow.restype = wintypes.BOOL
 user32.SetFocus.argtypes = [wintypes.HWND]
 user32.SetFocus.restype = wintypes.HWND
 kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+# Shell icon extraction: SHGetImageList is exported from shell32 by ordinal
+# only, so it is resolved with GetProcAddress at runtime.
+SHGFI_SYSICONINDEX = 0x000004000
+SHIL_JUMBO = 4
+ILD_TRANSPARENT = 0x00000001
+
+
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", wintypes.DWORD),
+        ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+def guid_from_text(text: str) -> GUID:
+    value = uuid.UUID(text)
+    return GUID(
+        value.fields[0],
+        value.fields[1],
+        value.fields[2],
+        (ctypes.c_ubyte * 8)(*value.bytes[8:]),
+    )
+
+
+IID_IIMAGE_LIST = guid_from_text("46EB5926-582E-4017-9FDF-E8998DAA0950")
+
+
+class ShellFileInfo(ctypes.Structure):
+    _fields_ = [
+        ("hIcon", wintypes.HICON),
+        ("iIcon", ctypes.c_int),
+        ("dwAttributes", wintypes.DWORD),
+        ("szDisplayName", wintypes.WCHAR * 260),
+        ("szTypeName", wintypes.WCHAR * 80),
+    ]
+
+
+shell32.SHGetFileInfoW.argtypes = [
+    wintypes.LPCWSTR,
+    wintypes.DWORD,
+    ctypes.POINTER(ShellFileInfo),
+    wintypes.UINT,
+    wintypes.UINT,
+]
+shell32.SHGetFileInfoW.restype = ctypes.c_void_p
+user32.DestroyIcon.argtypes = [wintypes.HICON]
+user32.DestroyIcon.restype = wintypes.BOOL
+
+_IMAGE_LIST_GET_ICON = ctypes.WINFUNCTYPE(
+    ctypes.c_long, ctypes.c_void_p, ctypes.c_int, wintypes.UINT,
+    ctypes.POINTER(wintypes.HICON),
+)
+_IMAGE_LIST_RELEASE = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)
+
+_shgetimagelist = None
+_shgetimagelist_resolved = False
+
+
+def _resolve_shgetimagelist():
+    """Look up SHGetImageList, which shell32 exports only by ordinal 727."""
+    global _shgetimagelist, _shgetimagelist_resolved
+    if _shgetimagelist_resolved:
+        return _shgetimagelist
+    _shgetimagelist_resolved = True
+    try:
+        kernel32.GetProcAddress.argtypes = [wintypes.HMODULE, ctypes.c_void_p]
+        kernel32.GetProcAddress.restype = ctypes.c_void_p
+        address = kernel32.GetProcAddress(
+            shell32._handle, ctypes.cast(727, ctypes.c_void_p)
+        )
+        if address:
+            prototype = ctypes.WINFUNCTYPE(
+                ctypes.c_long,
+                ctypes.c_int,
+                ctypes.POINTER(GUID),
+                ctypes.POINTER(ctypes.c_void_p),
+            )
+            _shgetimagelist = prototype(address)
+    except Exception:
+        _shgetimagelist = None
+    return _shgetimagelist
 
 
 def force_foreground(window: QWidget) -> None:
@@ -562,6 +645,65 @@ def save_hotkey(spec: HotkeySpec) -> None:
 # ---------------------------------------------------------------------------
 
 
+def load_large_icon(path: Path, size: int = 256) -> QIcon | None:
+    """Return the shortcut's high-resolution shell icon, or None.
+
+    QFileIconProvider caps shortcuts at 48 px, which looks soft when rows show
+    large icons. The shell's jumbo image list holds the real 256 px icons that
+    Explorer uses on large-icon views.
+    """
+    shgetimagelist = _resolve_shgetimagelist()
+    if shgetimagelist is None:
+        return None
+
+    try:
+        info = ShellFileInfo()
+        if not shell32.SHGetFileInfoW(
+            os.fspath(path),
+            0,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+            SHGFI_SYSICONINDEX,
+        ):
+            return None
+
+        image_list = ctypes.c_void_p()
+        if shgetimagelist(
+            SHIL_JUMBO, ctypes.byref(IID_IIMAGE_LIST), ctypes.byref(image_list)
+        ) != 0 or not image_list:
+            return None
+
+        vtable = ctypes.cast(
+            image_list, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+        ).contents
+        get_icon = _IMAGE_LIST_GET_ICON(vtable[10])
+        release = _IMAGE_LIST_RELEASE(vtable[2])
+        hicon = wintypes.HICON()
+        try:
+            if get_icon(
+                image_list, info.iIcon, ILD_TRANSPARENT, ctypes.byref(hicon)
+            ) != 0 or not hicon.value:
+                return None
+            image = QImage.fromHICON(hicon.value)
+        finally:
+            release(image_list)
+            if hicon.value:
+                user32.DestroyIcon(hicon)
+    except Exception:
+        return None
+
+    if image.isNull():
+        return None
+    if image.width() != size or image.height() != size:
+        image = image.scaled(
+            size,
+            size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+    return QIcon(QPixmap.fromImage(image))
+
+
 def make_app_icon() -> QIcon:
     icon = QIcon()
     for size in (16, 20, 24, 32, 48, 64, 128, 256):
@@ -600,9 +742,9 @@ def make_placeholder_icon() -> QIcon:
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QColor(255, 255, 255, 22))
+    painter.setBrush(QColor(120, 126, 136, 40))
     painter.drawRoundedRect(QRectF(8, 8, 48, 48), 13, 13)
-    painter.setBrush(QColor(255, 255, 255, 45))
+    painter.setBrush(QColor(120, 126, 136, 78))
     painter.drawRoundedRect(QRectF(23, 23, 18, 18), 5, 5)
     painter.end()
     return QIcon(pixmap)
@@ -845,6 +987,7 @@ class LauncherWindow(QWidget):
         self.visible_entries: list[ShortcutEntry] = []
         self._items_by_key: dict[str, QListWidgetItem] = {}
         self._icon_cache: dict[str, QIcon] = {}
+        self._large_icon_cache: dict[str, QIcon] = {}
         self._icon_provider = QFileIconProvider()
         self._placeholder_icon = make_placeholder_icon()
         self._suppress_deactivate_until = 0.0
@@ -865,7 +1008,6 @@ class LauncherWindow(QWidget):
             | Qt.WindowType.WindowStaysOnTopHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setFixedWidth(WINDOW_WIDTH)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         self._build_ui()
@@ -931,7 +1073,7 @@ class LauncherWindow(QWidget):
         self.app_list.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.app_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.app_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.app_list.setIconSize(QSize(26, 26))
+        self.app_list.setIconSize(QSize(LIST_ICON_SIZE, LIST_ICON_SIZE))
         self.app_list.setSpacing(ITEM_SPACING)
         self.app_list.setUniformItemSizes(True)
         self.app_list.setTextElideMode(Qt.TextElideMode.ElideRight)
@@ -980,10 +1122,10 @@ class LauncherWindow(QWidget):
             }
             QListWidget#AppList::item {
                 color: #202020;
-                border-radius: 9px;
-                padding-left: 10px;
+                border-radius: 14px;
+                padding-left: 16px;
                 font-family: "Segoe UI Variable Text", "Microsoft YaHei UI", "Segoe UI";
-                font-size: 10pt;
+                font-size: 13pt;
             }
             QListWidget#AppList::item:selected {
                 background-color: rgba(0, 120, 212, 28);
@@ -1087,23 +1229,24 @@ class LauncherWindow(QWidget):
             empty = QListWidgetItem("未找到匹配的快捷方式")
             empty.setFlags(Qt.ItemFlag.NoItemFlags)
             empty.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            empty.setSizeHint(QSize(0, 72))
+            # Fill the list so the message sits in the middle of the window.
+            empty.setSizeHint(
+                QSize(
+                    0,
+                    max(
+                        72,
+                        self.height()
+                        - SHADOW_MARGIN * 2
+                        - SEARCH_HEIGHT
+                        - 1
+                        - FOOTER_HEIGHT,
+                    ),
+                )
+            )
             empty.setForeground(QColor("#8A8A8A"))
             self.app_list.addItem(empty)
             self.app_list.setCurrentRow(-1)
             self.count_label.setText("0 个应用")
-
-        self._update_window_height()
-
-    def _update_window_height(self) -> None:
-        if self.visible_entries:
-            rows = min(len(self.visible_entries), MAX_ROWS)
-            list_height = rows * ROW_STEP + LIST_PADDING
-        else:
-            list_height = 92
-        self.app_list.setFixedHeight(list_height)
-        panel_height = SEARCH_HEIGHT + 1 + list_height + FOOTER_HEIGHT
-        self.setFixedHeight(panel_height + SHADOW_MARGIN * 2)
 
     def _load_icon_batch(self) -> None:
         pending = [entry for entry in self.entries if entry.icon is None]
@@ -1112,10 +1255,19 @@ class LauncherWindow(QWidget):
             return
 
         for entry in pending[:6]:
-            try:
-                icon = self._icon_provider.icon(QFileInfo(str(entry.path)))
-            except Exception:
-                icon = QIcon()
+            # Prefer the shell's 256 px icon: QFileIconProvider caps shortcuts
+            # at 48 px, which is too small now that rows show large icons.
+            icon = self._large_icon_cache.get(entry.key)
+            if icon is None or icon.isNull():
+                large = load_large_icon(entry.path)
+                if large is not None and not large.isNull():
+                    icon = large
+                    self._large_icon_cache[entry.key] = large
+                else:
+                    try:
+                        icon = self._icon_provider.icon(QFileInfo(str(entry.path)))
+                    except Exception:
+                        icon = QIcon()
             if icon.isNull():
                 # Mark as attempted so this entry is not retried on every tick.
                 entry.icon = QIcon()
@@ -1135,13 +1287,9 @@ class LauncherWindow(QWidget):
         screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
         if screen is None:
             return
-        area = screen.availableGeometry()
-        width = self.width()
-        height = self.height()
-        x = area.left() + (area.width() - width) // 2
-        y = area.top() + int((area.height() - height) * 0.26)
-        y = max(area.top() + 16, min(y, area.bottom() - height - 16))
-        self.move(x, y)
+        # Fill the whole usable screen; the panel keeps a small margin for its
+        # drop shadow and rounded corners.
+        self.setGeometry(screen.availableGeometry())
 
     def _animate_in(self) -> None:
         if self._fade_animation is not None:
@@ -1165,8 +1313,8 @@ class LauncherWindow(QWidget):
             self.search.blockSignals(True)
             self.search.clear()
             self.search.blockSignals(False)
-        self._apply_filter(select_first=True)
         self._place_window()
+        self._apply_filter(select_first=True)
         self._composing = False
         self._composition_ended_at = 0.0
         self._suppress_deactivate_until = time.monotonic() + 0.35
